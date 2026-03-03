@@ -42,15 +42,27 @@ class DualChannelRec(nn.Module):
             return torch.spmm(adj, embeds.float())
 
     def lightgcn_forward(self, adj):
-        """Pure LightGCN. Returns gnn_user_embeds, gnn_item_embeds."""
-        embeds_list = [torch.cat([self.user_embeding, self.item_embeding], dim=0)]
+        """LightGCN with dual-pass: returns LPF (standard) + HPF user embeds."""
+        embeds_0 = torch.cat([self.user_embeding, self.item_embeding], dim=0)
+        lpf_list = [embeds_0]   # layer-0 is shared (original embeddings)
+        hpf_list = []           # high-pass components per layer
+
+        cur = embeds_0
         for _ in range(args.block_num):
-            embeds_list.append(self.gnn_message_passing(adj, embeds_list[-1]))
-        # Mean / sum aggregation over layers
-        embeds = sum(embeds_list)
-        gnn_user_embeds = embeds[:args.user]
-        gnn_item_embeds = embeds[args.user:]
-        return gnn_user_embeds, gnn_item_embeds
+            smoothed = self.gnn_message_passing(adj, cur)
+            hpf_list.append(cur - smoothed)   # high-pass: identity − smoothed
+            lpf_list.append(smoothed)
+            cur = smoothed
+
+        # Standard LightGCN aggregation (sum over all layers including layer-0)
+        lpf_embeds = sum(lpf_list)
+        # HPF aggregation (sum of per-layer high-pass components)
+        hpf_embeds = sum(hpf_list)
+
+        gnn_user_embeds = lpf_embeds[:args.user]
+        gnn_item_embeds = lpf_embeds[args.user:]
+        hpf_user_embeds = hpf_embeds[:args.user]
+        return gnn_user_embeds, gnn_item_embeds, hpf_user_embeds
 
     # ==================================================================
     # Channel 2: Sequence Transformer
@@ -168,9 +180,9 @@ class DualChannelRec(nn.Module):
         mode = args.mode
 
         if mode == 'gnn_only':
-            gnn_user_embeds, gnn_item_embeds = self.lightgcn_forward(adj)
+            gnn_user_embeds, gnn_item_embeds, hpf_user_embeds = self.lightgcn_forward(adj)
             if ancs is not None:
-                return gnn_user_embeds[ancs], gnn_item_embeds
+                return gnn_user_embeds[ancs], gnn_item_embeds, gnn_user_embeds[ancs], hpf_user_embeds[ancs]
             return gnn_user_embeds, gnn_item_embeds
 
         if mode == 'transformer_only':
@@ -179,17 +191,19 @@ class DualChannelRec(nn.Module):
             return seq_user_embeds, item_embeds
 
         # mode == 'both': GNN + Transformer with gated fusion
-        gnn_user_embeds, gnn_item_embeds = self.lightgcn_forward(adj)
+        gnn_user_embeds, gnn_item_embeds, hpf_user_embeds = self.lightgcn_forward(adj)
         seq_user_embeds = self.seq_forward(user_seq, seq_mask)
 
         if ancs is not None:
             gnn_user_batch = gnn_user_embeds[ancs]
+            hpf_user_batch = hpf_user_embeds[ancs]
             final_user = self.gated_fusion(gnn_user_batch, seq_user_embeds)
         else:
             gnn_user_batch = gnn_user_embeds
+            hpf_user_batch = hpf_user_embeds
             final_user = self.gated_fusion(gnn_user_embeds, seq_user_embeds)
 
-        return final_user, gnn_item_embeds, gnn_user_batch, seq_user_embeds
+        return final_user, gnn_item_embeds, gnn_user_batch, seq_user_embeds, hpf_user_batch
 
     # ==================================================================
     # Losses
@@ -239,7 +253,8 @@ class DualChannelRec(nn.Module):
         mode = args.mode
 
         if mode == 'gnn_only':
-            return self.lightgcn_forward(adj)
+            gnn_user_embeds, gnn_item_embeds, _ = self.lightgcn_forward(adj)
+            return gnn_user_embeds, gnn_item_embeds
 
         # Compute sequence embeddings (used by transformer_only and both)
         num_users = all_user_seqs.shape[0]
@@ -256,6 +271,6 @@ class DualChannelRec(nn.Module):
             return seq_user_embeds, self.item_embeding
 
         # mode == 'both'
-        gnn_user_embeds, gnn_item_embeds = self.lightgcn_forward(adj)
+        gnn_user_embeds, gnn_item_embeds, _ = self.lightgcn_forward(adj)
         final_user_embeds = self.gated_fusion(gnn_user_embeds, seq_user_embeds)
         return final_user_embeds, gnn_item_embeds

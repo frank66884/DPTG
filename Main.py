@@ -38,7 +38,7 @@ class Coach:
 			print('USER', args.user, 'ITEM', args.item)
 			print('NUM OF INTERACTIONS', self.handler.trnLoader.dataset.__len__())
 		self.metrics = dict()
-		mets = ['Loss', 'preLoss', 'clLoss', 'Recall', 'NDCG']
+		mets = ['Loss', 'preLoss', 'clLoss', 'intraCLLoss', 'Recall', 'NDCG']
 		for met in mets:
 			self.metrics['Train' + met] = list()
 			self.metrics['Test' + met] = list()
@@ -102,6 +102,7 @@ class Coach:
 					'Train/Loss': reses['Loss'],
 					'Train/BPR_Loss': reses['preLoss'],
 					'Train/CL_Loss': reses['clLoss'],
+					'Train/Intra_CL_Loss': reses['intraCLLoss'],
 					'Train/LR': self.scheduler.get_last_lr()[0],
 				}, step=ep)
 			should_stop = t.tensor([0], dtype=t.long).cuda()
@@ -150,7 +151,7 @@ class Coach:
 		trnLoader.dataset.negSampling()
 		if self.handler.trnSampler is not None:
 			self.handler.trnSampler.set_epoch(ep)
-		epLoss, epPreLoss, epCLLoss = 0, 0, 0
+		epLoss, epPreLoss, epCLLoss, epIntraCLLoss = 0, 0, 0, 0
 		steps = len(trnLoader)
 		self.model.train()
 		with tqdm(enumerate(trnLoader), total=steps, desc='Epoch %d [Train]' % ep, ncols=100, disable=not self.is_main) as pbar:
@@ -168,21 +169,32 @@ class Coach:
 				with t.amp.autocast('cuda'):
 					outputs = self.model(self.handler.torchBiAdj, user_seq, seq_mask, ancs)
 					if args.mode == 'both':
-						user_embeds, item_embeds, gnn_view, seq_view = outputs
+						user_embeds, item_embeds, gnn_view, seq_view, hpf_view = outputs
 						bprLoss = self.raw_model.bprLoss(user_embeds, item_embeds, poss, negs)
 						clLoss = self.raw_model.infoNCELoss(gnn_view, seq_view)
+						intraCLLoss = self.raw_model.infoNCELoss(gnn_view, hpf_view)
 						# CL warmup: linearly ramp from 0 to cl_rate over cl_warmup epochs
 						cl_weight = args.cl_rate * min(1.0, ep / max(1, args.cl_warmup))
-						loss = bprLoss + cl_weight * clLoss
+						intra_cl_weight = args.intra_cl_rate * min(1.0, ep / max(1, args.cl_warmup))
+						loss = bprLoss + cl_weight * clLoss + intra_cl_weight * intraCLLoss
+					elif args.mode == 'gnn_only':
+						user_embeds, item_embeds, lpf_view, hpf_view = outputs
+						bprLoss = self.raw_model.bprLoss(user_embeds, item_embeds, poss, negs)
+						clLoss = t.tensor(0.0)
+						intraCLLoss = self.raw_model.infoNCELoss(lpf_view, hpf_view)
+						intra_cl_weight = args.intra_cl_rate * min(1.0, ep / max(1, args.cl_warmup))
+						loss = bprLoss + intra_cl_weight * intraCLLoss
 					else:
 						user_embeds, item_embeds = outputs
 						bprLoss = self.raw_model.bprLoss(user_embeds, item_embeds, poss, negs)
 						clLoss = t.tensor(0.0)
+						intraCLLoss = t.tensor(0.0)
 						loss = bprLoss
 	
 				epLoss += loss.item()
 				epPreLoss += bprLoss.item()
 				epCLLoss += clLoss.item()
+				epIntraCLLoss += intraCLLoss.item()
 				self.opt.zero_grad()
 				self.scaler.scale(loss).backward()
 				self.scaler.unscale_(self.opt)
@@ -195,6 +207,7 @@ class Coach:
 		ret['Loss'] = epLoss / steps
 		ret['preLoss'] = epPreLoss / steps
 		ret['clLoss'] = epCLLoss / steps
+		ret['intraCLLoss'] = epIntraCLLoss / steps
 		return ret
 
 	def testEpoch(self, ep=0):
@@ -299,6 +312,8 @@ class Coach:
 				'Train/BPR_Loss': self.metrics['TrainpreLoss'][i],
 				'Train/CL_Loss': self.metrics['TrainclLoss'][i],
 			}
+			if 'TrainintraCLLoss' in self.metrics and i < len(self.metrics['TrainintraCLLoss']):
+				log_dict['Train/Intra_CL_Loss'] = self.metrics['TrainintraCLLoss'][i]
 			if i < len(self.metrics['TestRecall']):
 				log_dict['Test/Recall@%d' % args.topk] = self.metrics['TestRecall'][i]
 			if i < len(self.metrics['TestNDCG']):
@@ -373,6 +388,11 @@ class Coach:
 		else:
 			self.metrics = his_content
 			self.bestRecall = 0
+		# 兼容旧 checkpoint：补齐 intraCLLoss 指标
+		for prefix in ('Train', 'Test'):
+			key = prefix + 'intraCLLoss'
+			if key not in self.metrics:
+				self.metrics[key] = [0.0] * len(self.metrics.get(prefix + 'Loss', []))
 		# 加载 bestEpoch，兼容旧格式
 		if isinstance(his_content, dict) and 'bestEpoch' in his_content:
 			self.bestEpoch = his_content['bestEpoch']
