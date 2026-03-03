@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# Allow .py files
+!*.py
+!**/*.py
+
+# Allow .gitignore itself
+!.gitignore
+
+# Allow directory traversal
+!*/
